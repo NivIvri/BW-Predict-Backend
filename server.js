@@ -1,6 +1,8 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const { spawn } = require('child_process');
+const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
@@ -28,6 +30,28 @@ async function requireAuth(req, res, next) {
 
   req.user = user;
   next();
+}
+
+const ML_SCRIPT = path.join(__dirname, 'ml_model', 'predict.py');
+
+function runModel(payload) {
+  return new Promise((resolve, reject) => {
+    const py = spawn('python', [ML_SCRIPT]);
+    let stdout = '';
+    let stderr = '';
+    py.stdout.on('data', chunk => { stdout += chunk; });
+    py.stderr.on('data', chunk => { stderr += chunk; });
+    py.on('close', code => {
+      if (code !== 0) return reject(new Error(`ML model exited ${code}: ${stderr}`));
+      try {
+        resolve(JSON.parse(stdout));
+      } catch (e) {
+        reject(new Error(`Failed to parse model output: ${stdout}`));
+      }
+    });
+    py.stdin.write(JSON.stringify(payload));
+    py.stdin.end();
+  });
 }
 
 // ── Health check ────────────────────────────────────────────────────
@@ -85,22 +109,10 @@ app.post('/predict', requireAuth, async (req, res) => {
       patient = created;
     }
 
-    // 2. ML model placeholder — replace this block with the real model call
-    const efwUltrasound   = Number(fetalBiometry?.efwUltrasound) || 3200;
-    const clinicalEst     = Number(fetalBiometry?.clinicalEstimation) || 3200;
-    const bmi             = Number(maternalInfo?.bmi) || 23;
-    const bmiAdjust       = bmi > 30 ? 80 : bmi < 18.5 ? -60 : 0;
-    const predictedWeight = Math.round((efwUltrasound * 0.6 + clinicalEst * 0.4) + bmiAdjust);
+    // 2. Run ML model via Python subprocess
+    const { predictedWeight, shapExplanation } = await runModel({ maternalInfo, obstetricHistory, fetalBiometry });
 
-    // 3. SHAP explanation placeholder
-    const shapExplanation = [
-      { factor: 'Ultrasound EFW',        value: efwUltrasound,                        contribution: 320, direction: 'positive' },
-      { factor: 'Clinical Estimation',   value: Number(fetalBiometry.clinicalEstimation) || 3100, contribution: 180, direction: 'positive' },
-      { factor: 'Gestational Age',       value: Number(fetalBiometry.gestationalAge) || 38,        contribution: 140, direction: 'positive' },
-      { factor: 'Abdominal Circumference', value: Number(fetalBiometry.ac) || 340,                contribution: 90,  direction: 'positive' },
-      { factor: 'Maternal BMI',          value: bmi, contribution: bmi > 25 ? 60 : -40, direction: bmi > 25 ? 'positive' : 'negative' },
-      { factor: 'AFI',                   value: Number(fetalBiometry.afi) || 12,                  contribution: 30,  direction: 'positive' },
-    ].sort((a, b) => Math.abs(b.contribution) - Math.abs(a.contribution));
+    // 3. (SHAP explanation returned by runModel above)
 
     // 4. Save prediction to DB
     const { data: saved, error: saveErr } = await db
@@ -110,6 +122,7 @@ app.post('/predict', requireAuth, async (req, res) => {
         doctor_id:                   req.user.id,
         age:                         Number(maternalInfo.age) || null,
         pre_pregnancy_weight:        Number(maternalInfo.weightBeforePregnancy) || null,
+        current_weight:              Number(maternalInfo.currentWeight) || null,
         bmi:                         Number(maternalInfo.bmi) || null,
         gestational_age_days:        Number(fetalBiometry.gestationalAge) * 7 || null,
         smoking:                     maternalInfo.smoking,
@@ -130,6 +143,7 @@ app.post('/predict', requireAuth, async (req, res) => {
         fl:                          Number(fetalBiometry.fl) || null,
         afi:                         Number(fetalBiometry.afi) || null,
         induction:                   fetalBiometry.induction,
+        fetal_sex:                   fetalBiometry.fetalSex ?? null,
         sonographic_weight_estimate: Number(fetalBiometry.efwUltrasound) || null,
         clinical_weight_estimate:    Number(fetalBiometry.clinicalEstimation) || null,
         predicted_birth_weight:      predictedWeight,
